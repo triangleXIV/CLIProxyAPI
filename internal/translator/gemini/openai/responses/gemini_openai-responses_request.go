@@ -590,11 +590,16 @@ func stripTrailingOpenAIResponsesModelPrefill(payload []byte) []byte {
 		items = append(items, []byte(content.Raw))
 	}
 	if len(items) == 0 {
-		updated, errSet := sjson.SetRawBytes(payload, "contents", []byte("[]"))
-		if errSet == nil {
-			return updated
+		// The trailing model turn is the only content; stripping it would
+		// leave an empty contents array, which the upstream rejects with
+		// "contents is not specified", while keeping it makes the request
+		// end with a model turn, which the upstream also rejects. Rewrite
+		// the single turn as a user turn so the request stays valid.
+		rewritten, errRole := sjson.SetBytes([]byte(contentArray[len(contentArray)-1].Raw), "role", "user")
+		if errRole != nil {
+			return payload
 		}
-		return payload
+		return translatorcommon.SetRawArrayItems(payload, "contents", [][]byte{rewritten})
 	}
 	return translatorcommon.SetRawArrayItems(payload, "contents", items)
 }
