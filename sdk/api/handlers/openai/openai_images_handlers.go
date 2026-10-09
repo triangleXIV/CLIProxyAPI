@@ -237,7 +237,7 @@ func isSupportedImagesModel(model string) bool {
 	if isCodexImagesToolModel(model) {
 		return true
 	}
-	return isXAIImagesModel(model) || isOpenAICompatImagesModel(model)
+	return isXAIImagesModel(model) || isOpenAICompatImagesModel(model) || isGeminiImagesModel(model)
 }
 
 func isCodexImagesToolModel(model string) bool {
@@ -265,7 +265,7 @@ func rejectUnsupportedImagesModel(c *gin.Context, model string) bool {
 
 	c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 		Error: handlers.ErrorDetail{
-			Message: fmt.Sprintf("Model %s is not supported on %s or %s. Use %s, %s, %s, %s, %s, %s, %s, %s, or a configured openai-compatibility image model.", model, imagesGenerationsPath, imagesEditsPath, gptImage15Model, defaultImagesToolModel, gptImage25FlareModel, gptImage25SunburstModel, gptImage25Model, defaultXAIImagesModel, xaiImagesQualityModel, xaiImages20Model),
+			Message: fmt.Sprintf("Model %s is not supported on %s or %s. Use %s, %s, %s, %s, %s, %s, %s, %s, a Gemini image model (gemini-*-image), or a configured openai-compatibility image model.", model, imagesGenerationsPath, imagesEditsPath, gptImage15Model, defaultImagesToolModel, gptImage25FlareModel, gptImage25SunburstModel, gptImage25Model, defaultXAIImagesModel, xaiImagesQualityModel, xaiImages20Model),
 			Type:    "invalid_request_error",
 		},
 	})
@@ -616,6 +616,365 @@ func parseBoolField(raw string, fallback bool) bool {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Gemini native image models (gemini-*-image) on the OpenAI Images API.
+//
+// The OpenAI /v1/images/generations and /v1/images/edits endpoints accept
+// Gemini image models (gemini-3.1-flash-image, gemini-2.5-flash-image, ...).
+// The request is converted to a Gemini generateContent payload (identical to
+// the /v1beta native surface) and executed through the gemini handler type,
+// so every auth registered for the native Gemini surface (API keys, Vertex,
+// Antigravity, AI Studio) can serve it. Response inlineData parts are
+// converted back to OpenAI images JSON (b64_json).
+// ---------------------------------------------------------------------------
+
+const geminiImagesHandlerType = "gemini"
+
+func isGeminiImagesModel(model string) bool {
+	baseModel := imagesModelBase(model)
+	return strings.HasPrefix(baseModel, "gemini-") &&
+		(strings.HasSuffix(baseModel, "-image") || strings.Contains(baseModel, "-image-"))
+}
+
+type geminiImagesOptions struct {
+	AspectRatio string
+	ImageSize   string
+	Size        string
+	Quality     string
+	N           int64
+}
+
+// geminiImagesOptionsFromJSON collects image-relevant options from an OpenAI
+// images JSON body. Both OpenAI spellings (size/quality) and Gemini/OpenRouter
+// style spellings (aspect_ratio/image_size, image_config.{aspect_ratio,
+// image_size}) are honored; explicit Gemini spellings win over OpenAI ones.
+func geminiImagesOptionsFromJSON(rawJSON []byte) geminiImagesOptions {
+	opts := geminiImagesOptions{
+		AspectRatio: strings.TrimSpace(gjson.GetBytes(rawJSON, "aspect_ratio").String()),
+		ImageSize:   strings.TrimSpace(gjson.GetBytes(rawJSON, "image_size").String()),
+		Size:        strings.TrimSpace(gjson.GetBytes(rawJSON, "size").String()),
+		Quality:     strings.TrimSpace(gjson.GetBytes(rawJSON, "quality").String()),
+	}
+	if v := gjson.GetBytes(rawJSON, "n"); v.Exists() && v.Type == gjson.Number {
+		opts.N = v.Int()
+	}
+	imgCfg := gjson.GetBytes(rawJSON, "image_config")
+	if imgCfg.Exists() {
+		if v := strings.TrimSpace(imgCfg.Get("aspect_ratio").String()); v != "" {
+			opts.AspectRatio = v
+		}
+		if v := strings.TrimSpace(imgCfg.Get("aspectRatio").String()); v != "" {
+			opts.AspectRatio = v
+		}
+		if v := strings.TrimSpace(imgCfg.Get("image_size").String()); v != "" {
+			opts.ImageSize = v
+		}
+		if v := strings.TrimSpace(imgCfg.Get("imageSize").String()); v != "" {
+			opts.ImageSize = v
+		}
+	}
+	return opts
+}
+
+// geminiImagesAspectRatioFromSize maps an OpenAI images "size" (WxH pixels) to
+// a Gemini imageConfig.aspectRatio. Direct ratio values and common aliases
+// pass through; unknown or "auto" values fall back to the upstream default.
+func geminiImagesAspectRatioFromSize(size string) string {
+	switch strings.ToLower(strings.TrimSpace(size)) {
+	case "auto", "":
+		return ""
+	case "1:1", "square":
+		return "1:1"
+	case "16:9", "landscape":
+		return "16:9"
+	case "9:16", "portrait":
+		return "9:16"
+	case "4:3":
+		return "4:3"
+	case "3:4":
+		return "3:4"
+	case "4:5":
+		return "4:5"
+	case "5:4":
+		return "5:4"
+	case "3:2":
+		return "3:2"
+	case "2:3":
+		return "2:3"
+	case "21:9":
+		return "21:9"
+	case "1024x1024", "2048x2048", "512x512":
+		return "1:1"
+	case "1536x1024", "1792x1024":
+		return "3:2"
+	case "1024x1536", "1024x1792":
+		return "2:3"
+	case "1920x1080", "1280x720":
+		return "16:9"
+	case "1080x1920", "720x1280":
+		return "9:16"
+	default:
+		return ""
+	}
+}
+
+// geminiImagesSizeTier resolves the Gemini imageConfig.imageSize tier (1K/2K/4K)
+// from explicit tier fields, an OpenAI size that names a tier, or OpenAI
+// quality semantics. Empty result means "leave the upstream default".
+func geminiImagesSizeTier(explicit string, size string, quality string) string {
+	normalize := func(v string) string {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1k", "1024":
+			return "1K"
+		case "2k", "2048":
+			return "2K"
+		case "4k", "4096":
+			return "4K"
+		default:
+			return ""
+		}
+	}
+	if tier := normalize(explicit); tier != "" {
+		return tier
+	}
+	if tier := normalize(size); tier != "" {
+		return tier
+	}
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "low", "standard":
+		return "1K"
+	case "medium":
+		return "2K"
+	case "high", "hd":
+		return "4K"
+	default:
+		return ""
+	}
+}
+
+// buildGeminiImagesGenerationConfig assembles the Gemini generationConfig for
+// image generation: responseModalities IMAGE+TEXT plus the resolved
+// imageConfig (aspect ratio + size tier) and candidateCount for n>1.
+func buildGeminiImagesGenerationConfig(opts geminiImagesOptions) []byte {
+	cfg := []byte(`{"responseModalities":["IMAGE","TEXT"]}`)
+	aspectRatio := opts.AspectRatio
+	if aspectRatio == "" {
+		aspectRatio = geminiImagesAspectRatioFromSize(opts.Size)
+	}
+	imageSize := geminiImagesSizeTier(opts.ImageSize, opts.Size, opts.Quality)
+	if aspectRatio != "" {
+		cfg, _ = sjson.SetBytes(cfg, "imageConfig.aspectRatio", aspectRatio)
+	}
+	if imageSize != "" {
+		cfg, _ = sjson.SetBytes(cfg, "imageConfig.imageSize", imageSize)
+	}
+	if opts.N > 1 {
+		cfg, _ = sjson.SetBytes(cfg, "candidateCount", opts.N)
+	}
+	return cfg
+}
+
+// dataURLToGeminiInlineData converts a base64 data URL to the raw mime type and
+// base64 payload pair used by Gemini inlineData parts.
+func dataURLToGeminiInlineData(dataURL string) (string, string, error) {
+	raw := strings.TrimSpace(dataURL)
+	if !strings.HasPrefix(strings.ToLower(raw), "data:") {
+		return "", "", fmt.Errorf("image input must be a base64 data URL for Gemini image models (https URLs are not supported)")
+	}
+	rest := strings.TrimPrefix(raw, "data:")
+	semi := strings.Index(rest, ",")
+	if semi < 0 {
+		return "", "", fmt.Errorf("invalid image data URL: missing base64 payload")
+	}
+	meta := rest[:semi]
+	payload := rest[semi+1:]
+	mimeType := strings.TrimSpace(strings.Split(meta, ";")[0])
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+	if !strings.Contains(meta, ";base64") {
+		return "", "", fmt.Errorf("invalid image data URL: base64 encoding is required")
+	}
+	if payload == "" {
+		return "", "", fmt.Errorf("invalid image data URL: empty payload")
+	}
+	return mimeType, payload, nil
+}
+
+// buildGeminiImagesPayload assembles the Gemini generateContent payload for an
+// OpenAI images request: prompt as text part, input images (edits) as
+// inlineData parts, plus the image generationConfig.
+func buildGeminiImagesPayload(prompt string, imageDataURLs []string, opts geminiImagesOptions) ([]byte, error) {
+	parts := []byte(`[{"text":""}]`)
+	parts, _ = sjson.SetBytes(parts, "0.text", strings.TrimSpace(prompt))
+	for _, imageURL := range imageDataURLs {
+		mimeType, b64, err := dataURLToGeminiInlineData(imageURL)
+		if err != nil {
+			return nil, err
+		}
+		part := []byte(`{"inlineData":{"mimeType":"","data":""}}`)
+		part, _ = sjson.SetBytes(part, "inlineData.mimeType", mimeType)
+		part, _ = sjson.SetBytes(part, "inlineData.data", b64)
+		parts, _ = sjson.SetRawBytes(parts, "-1", part)
+	}
+	payload := []byte(`{"contents":[{"role":"user","parts":[]}],"generationConfig":{}}`)
+	payload, _ = sjson.SetRawBytes(payload, "contents.0.parts", parts)
+	payload, _ = sjson.SetRawBytes(payload, "generationConfig", buildGeminiImagesGenerationConfig(opts))
+	return payload, nil
+}
+
+type geminiImagePart struct {
+	MimeType string
+	B64JSON  string
+}
+
+// extractGeminiImagesResponse pulls every inlineData image out of a Gemini
+// generateContent response (all candidates) and builds an OpenAI usage object
+// from usageMetadata.
+func extractGeminiImagesResponse(payload []byte) ([]geminiImagePart, []byte, error) {
+	candidates := gjson.GetBytes(payload, "candidates")
+	if !candidates.IsArray() {
+		if msg := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String()); msg != "" {
+			return nil, nil, fmt.Errorf("upstream error: %s", msg)
+		}
+		return nil, nil, fmt.Errorf("upstream returned no image data")
+	}
+	images := make([]geminiImagePart, 0, 1)
+	for _, candidate := range candidates.Array() {
+		parts := candidate.Get("content.parts")
+		if !parts.IsArray() {
+			continue
+		}
+		for _, part := range parts.Array() {
+			inline := part.Get("inlineData")
+			if !inline.Exists() {
+				inline = part.Get("inline_data")
+			}
+			if !inline.Exists() {
+				continue
+			}
+			data := strings.TrimSpace(inline.Get("data").String())
+			if data == "" {
+				continue
+			}
+			mimeType := strings.TrimSpace(inline.Get("mimeType").String())
+			if mimeType == "" {
+				mimeType = strings.TrimSpace(inline.Get("mime_type").String())
+			}
+			if mimeType == "" {
+				mimeType = "image/png"
+			}
+			images = append(images, geminiImagePart{MimeType: mimeType, B64JSON: data})
+		}
+	}
+	if len(images) == 0 {
+		return nil, nil, fmt.Errorf("upstream returned no image data")
+	}
+
+	usage := []byte("")
+	meta := gjson.GetBytes(payload, "usageMetadata")
+	if !meta.Exists() {
+		meta = gjson.GetBytes(payload, "usage_metadata")
+	}
+	if meta.Exists() {
+		promptTokens := meta.Get("promptTokenCount")
+		if !promptTokens.Exists() {
+			promptTokens = meta.Get("prompt_token_count")
+		}
+		completionTokens := meta.Get("candidatesTokenCount")
+		if !completionTokens.Exists() {
+			completionTokens = meta.Get("candidates_token_count")
+		}
+		totalTokens := meta.Get("totalTokenCount")
+		if !totalTokens.Exists() {
+			totalTokens = meta.Get("total_token_count")
+		}
+		if promptTokens.Exists() || completionTokens.Exists() || totalTokens.Exists() {
+			usage = []byte(`{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}`)
+			if promptTokens.Exists() {
+				usage, _ = sjson.SetBytes(usage, "prompt_tokens", promptTokens.Int())
+			}
+			if completionTokens.Exists() {
+				usage, _ = sjson.SetBytes(usage, "completion_tokens", completionTokens.Int())
+			}
+			if totalTokens.Exists() {
+				usage, _ = sjson.SetBytes(usage, "total_tokens", totalTokens.Int())
+			}
+		}
+	}
+	return images, usage, nil
+}
+
+// buildImagesAPIResponseFromGemini converts a Gemini generateContent response
+// into the OpenAI images API response shape.
+func buildImagesAPIResponseFromGemini(payload []byte, responseFormat string) ([]byte, error) {
+	images, usage, err := extractGeminiImagesResponse(payload)
+	if err != nil {
+		return nil, err
+	}
+	out := []byte(`{"created":0,"data":[]}`)
+	out, _ = sjson.SetBytes(out, "created", time.Now().Unix())
+	responseFormat = normalizeImagesResponseFormat(responseFormat)
+	for _, img := range images {
+		item := []byte(`{}`)
+		if responseFormat == "url" {
+			item, _ = sjson.SetBytes(item, "url", "data:"+img.MimeType+";base64,"+img.B64JSON)
+		} else {
+			item, _ = sjson.SetBytes(item, "b64_json", img.B64JSON)
+			item, _ = sjson.SetBytes(item, "mime_type", img.MimeType)
+		}
+		out, _ = sjson.SetRawBytes(out, "data.-1", item)
+	}
+	if len(usage) > 0 && json.Valid(usage) {
+		out, _ = sjson.SetRawBytes(out, "usage", usage)
+	}
+	return out, nil
+}
+
+// handleGeminiImages executes an OpenAI images request against a Gemini image
+// model through the native Gemini surface and writes the OpenAI images JSON
+// response. Streaming is not offered on this path: the upstream call is
+// always non-streaming and the result is returned as plain JSON, which every
+// OpenAI-format client (and the OpenAI images spec) accepts.
+func (h *OpenAIAPIHandler) handleGeminiImages(c *gin.Context, prompt string, imageDataURLs []string, opts geminiImagesOptions, model string, responseFormat string) {
+	payload, err := buildGeminiImagesPayload(prompt, imageDataURLs, opts)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	c.Header("Content-Type", "application/json")
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, geminiImagesHandlerType, model, payload, "")
+	stopKeepAlive()
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		if errMsg.Error != nil {
+			cliCancel(errMsg.Error)
+		} else {
+			cliCancel(nil)
+		}
+		return
+	}
+
+	out, err := buildImagesAPIResponseFromGemini(resp, responseFormat)
+	if err != nil {
+		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(err)
+		return
+	}
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write(out)
+	cliCancel(nil)
+}
+
 func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	if h != nil && h.BaseAPIHandler != nil && h.BaseAPIHandler.Cfg != nil && h.BaseAPIHandler.Cfg.DisableImageGeneration == internalconfig.DisableImageGenerationAll {
 		c.AbortWithStatus(http.StatusNotFound)
@@ -680,6 +1039,10 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	if isOpenAICompatImagesModel(imageModel) {
 		compatReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
 		h.handleOpenAICompatImages(c, compatReq, imageModel, responseFormat, "image_generation", stream)
+		return
+	}
+	if isGeminiImagesModel(imageModel) {
+		h.handleGeminiImages(c, prompt, nil, geminiImagesOptionsFromJSON(rawJSON), imageModel, responseFormat)
 		return
 	}
 
@@ -852,6 +1215,30 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		h.handleOpenAICompatImages(c, compatReq, imageModel, responseFormat, "image_edit", stream)
 		return
 	}
+	if isGeminiImagesModel(imageModel) {
+		opts := geminiImagesOptions{
+			AspectRatio: strings.TrimSpace(c.PostForm("aspect_ratio")),
+			ImageSize:   strings.TrimSpace(c.PostForm("image_size")),
+			Size:        strings.TrimSpace(c.PostForm("size")),
+			Quality:     strings.TrimSpace(c.PostForm("quality")),
+			N:           parseIntField(c.PostForm("n"), 0),
+		}
+		if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+			dataURL, errMask := multipartFileToDataURL(maskFiles[0])
+			if errMask != nil {
+				c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+					Error: handlers.ErrorDetail{
+						Message: fmt.Sprintf("Invalid request: %v", errMask),
+						Type:    "invalid_request_error",
+					},
+				})
+				return
+			}
+			images = append(images, dataURL)
+		}
+		h.handleGeminiImages(c, prompt, images, opts, imageModel, responseFormat)
+		return
+	}
 
 	var maskDataURL *string
 	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
@@ -979,6 +1366,23 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	if isOpenAICompatImagesModel(imageModel) {
 		compatReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
 		h.handleOpenAICompatImages(c, compatReq, imageModel, responseFormat, "image_edit", stream)
+		return
+	}
+	if isGeminiImagesModel(imageModel) {
+		images := collectXAIImagesFromJSON(rawJSON)
+		if len(images) == 0 {
+			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+				Error: handlers.ErrorDetail{
+					Message: "Invalid request: image is required",
+					Type:    "invalid_request_error",
+				},
+			})
+			return
+		}
+		if mask := strings.TrimSpace(gjson.GetBytes(rawJSON, "mask.image_url").String()); mask != "" {
+			images = append(images, mask)
+		}
+		h.handleGeminiImages(c, prompt, images, geminiImagesOptionsFromJSON(rawJSON), imageModel, responseFormat)
 		return
 	}
 
