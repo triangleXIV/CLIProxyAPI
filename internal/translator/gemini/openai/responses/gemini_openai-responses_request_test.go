@@ -3624,3 +3624,31 @@ func TestConvertOpenAIResponsesRequestToGemini_StripsTrailingAssistantPrefillWhe
 		t.Fatalf("remaining role = %q, want user", contents[0].Get("role").String())
 	}
 }
+
+
+func TestConvertOpenAIResponsesRequestToGemini_SystemOnlyInputSynthesizesContents(t *testing.T) {
+	inputJSON := `{
+		"model":"gemini-3.8-flash-high",
+		"input":[
+			{"type":"message","role":"system","content":"You are a game NPC. Greet the player."}
+		]
+	}`
+	result, err := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(inputJSON), false)
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	contents := gjson.GetBytes(result, "contents").Array()
+	if len(contents) == 0 {
+		t.Fatalf("contents empty for system-only input: %s", result)
+	}
+	first := contents[0]
+	if first.Get("role").String() != "user" {
+		t.Fatalf("synthesized role = %q, want user", first.Get("role").String())
+	}
+	if !strings.Contains(first.Get("parts.0.text").String(), "game NPC") {
+		t.Fatalf("system text missing from synthesized turn: %s", first.Raw)
+	}
+	if gjson.GetBytes(result, "systemInstruction").Exists() {
+		t.Fatalf("systemInstruction should be moved into contents, not duplicated")
+	}
+}
