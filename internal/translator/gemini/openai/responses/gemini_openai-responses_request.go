@@ -522,7 +522,38 @@ func convertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	if useGeminiNativeReasoningLayout {
 		result = sigcompat.SanitizeGeminiRequestThoughtSignatures(result, "contents")
 	}
-	return stripTrailingOpenAIResponsesModelPrefill(result), drops.Err()
+	result = stripTrailingOpenAIResponsesModelPrefill(result)
+	result = ensureResponsesContentsPresent(result)
+	return result, drops.Err()
+}
+
+// ensureResponsesContentsPresent guards against requests whose input carried
+// only system/developer messages: the conversation text ends up in
+// systemInstruction while contents stays empty, and the upstream rejects the
+// request with 400 "contents is not specified". In that case move the system
+// text into a single user turn so the model has something to answer.
+func ensureResponsesContentsPresent(payload []byte) []byte {
+	contents := gjson.GetBytes(payload, "contents")
+	if contents.IsArray() && len(contents.Array()) > 0 {
+		return payload
+	}
+	sys := gjson.GetBytes(payload, "systemInstruction")
+	if !sys.IsObject() {
+		return payload
+	}
+	var parts [][]byte
+	sys.Get("parts").ForEach(func(_, p gjson.Result) bool {
+		if p.Get("text").Exists() && strings.TrimSpace(p.Get("text").String()) != "" {
+			parts = append(parts, []byte(p.Raw))
+		}
+		return true
+	})
+	if len(parts) == 0 {
+		return payload
+	}
+	updated := translatorcommon.SetRawArrayItems(payload, "contents", [][]byte{geminiContent("user", parts)})
+	updated, _ = sjson.DeleteBytes(updated, "systemInstruction")
+	return updated
 }
 
 func geminiContent(role string, parts [][]byte) []byte {
