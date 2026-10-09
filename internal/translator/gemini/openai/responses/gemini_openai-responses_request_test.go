@@ -3581,3 +3581,46 @@ func TestConvertOpenAIResponsesRequestToGemini_UnsignedModelTextDoesNotSynthesiz
 		t.Fatalf("sanitizer left unexpected thoughtSignature on text part: %s", sanitizedParts[1].Raw)
 	}
 }
+
+
+func TestConvertOpenAIResponsesRequestToGemini_AssistantOnlyInputKeepsContents(t *testing.T) {
+	inputJSON := `{
+		"model":"gemini-3.8-flash-high",
+		"input":[
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefill only turn"}]}
+		]
+	}`
+	result, err := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(inputJSON), false)
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	contents := gjson.GetBytes(result, "contents").Array()
+	if len(contents) == 0 {
+		t.Fatalf("contents empty for assistant-only input: %s", result)
+	}
+	last := contents[len(contents)-1]
+	if last.Get("role").String() != "user" {
+		t.Fatalf("single assistant-only turn must be rewritten as user, got role=%q", last.Get("role").String())
+	}
+	if last.Get("parts.0.text").String() != "prefill only turn" {
+		t.Fatalf("rewritten turn lost its text: %s", last.Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToGemini_StripsTrailingAssistantPrefillWhenUserPresent(t *testing.T) {
+	inputJSON := `{
+		"model":"gemini-3.8-flash-high",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefill"}]}
+		]
+	}`
+	result, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(inputJSON), false)
+	contents := gjson.GetBytes(result, "contents").Array()
+	if len(contents) != 1 {
+		t.Fatalf("contents len = %d, want 1 (trailing prefill stripped)", len(contents))
+	}
+	if contents[0].Get("role").String() != "user" {
+		t.Fatalf("remaining role = %q, want user", contents[0].Get("role").String())
+	}
+}
