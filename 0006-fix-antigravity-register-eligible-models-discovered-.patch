@@ -1,0 +1,408 @@
+From 545c9004c169a239ada0988c0a380bfef3f90c88 Mon Sep 17 00:00:00 2001
+From: triangleXIV <127415617+triangleXIV@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 10:41:52 +0800
+Subject: [PATCH 6/8] fix(antigravity): register eligible models discovered per
+ account
+
+---
+ sdk/cliproxy/antigravity_model_catalog.go     | 135 ++++++++++++++
+ .../antigravity_model_catalog_test.go         | 169 ++++++++++++++++++
+ sdk/cliproxy/antigravity_models.go            |  35 +++-
+ 3 files changed, 331 insertions(+), 8 deletions(-)
+ create mode 100644 sdk/cliproxy/antigravity_model_catalog.go
+ create mode 100644 sdk/cliproxy/antigravity_model_catalog_test.go
+
+diff --git a/sdk/cliproxy/antigravity_model_catalog.go b/sdk/cliproxy/antigravity_model_catalog.go
+new file mode 100644
+index 00000000..06a5500f
+--- /dev/null
++++ b/sdk/cliproxy/antigravity_model_catalog.go
+@@ -0,0 +1,135 @@
++package cliproxy
++
++import (
++	"encoding/json"
++	"slices"
++	"strings"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++)
++
++type antigravityDiscoveredModel struct {
++	DisplayName               string          `json:"displayName"`
++	IsInternal                bool            `json:"isInternal"`
++	MaxTokens                 int             `json:"maxTokens"`
++	MaxOutputTokens           int             `json:"maxOutputTokens"`
++	SupportsImages            bool            `json:"supportsImages"`
++	SupportsVideo             bool            `json:"supportsVideo"`
++	SupportedMimeTypes        map[string]bool `json:"supportedMimeTypes"`
++	SupportedOutputModalities []string        `json:"supportedOutputModalities"`
++	SupportsThinking          bool            `json:"supportsThinking"`
++	MinThinkingBudget         *int            `json:"minThinkingBudget"`
++	ThinkingBudget            *int            `json:"thinkingBudget"`
++}
++
++// Keep curated definitions for existing models, but discover eligible additions
++// from the same account catalog that grants their routing entitlement.
++func appendAntigravityDiscoveredModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
++	seen := make(map[string]struct{}, len(models))
++	for _, model := range models {
++		seen[normalizeAntigravityFetchedModelID(model.ID)] = struct{}{}
++	}
++	ids := make([]string, 0, len(hints.Models))
++	for id := range hints.Models {
++		if _, entitled := hints.ModelIDs[id]; !entitled {
++			continue
++		}
++		if _, exists := seen[id]; !exists {
++			ids = append(ids, id)
++		}
++	}
++	slices.Sort(ids)
++	for _, id := range ids {
++		if model := discoveredAntigravityModelInfo(id, hints.Models[id], hints.ImageGenerationModelIDs); model != nil {
++			models = append(models, model)
++		}
++	}
++	return models
++}
++
++func discoveredAntigravityModelInfo(id string, raw json.RawMessage, images map[string]struct{}) *ModelInfo {
++	var discovered antigravityDiscoveredModel
++	if json.Unmarshal(raw, &discovered) != nil || discovered.IsInternal || strings.TrimSpace(discovered.DisplayName) == "" {
++		return nil
++	}
++	// The executor supports these conversational families. Editor completions,
++	// tier routers, transcription and other media protocols are not chat models.
++	isGemini := strings.HasPrefix(id, "gemini-")
++	if !isGemini && !strings.HasPrefix(id, "claude-") && !strings.HasPrefix(id, "gpt-oss-") {
++		return nil
++	}
++	if strings.HasSuffix(id, "-tiered") || strings.ContainsAny(id, " /\\()") {
++		return nil
++	}
++	for _, marker := range []string{"-tts", "-audio", "-live", "-video", "-veo", "-transcription"} {
++		if strings.Contains(id, marker) {
++			return nil
++		}
++	}
++	_, imageGeneration := images[id]
++	if imageGeneration && (!isGemini || !strings.Contains(id, "-image")) {
++		return nil
++	}
++	if strings.Contains(id, "-image") && !imageGeneration {
++		return nil
++	}
++	for _, modality := range discovered.SupportedOutputModalities {
++		switch strings.ToLower(modality) {
++		case "text":
++		case "image":
++			if !imageGeneration {
++				return nil
++			}
++		default:
++			return nil
++		}
++	}
++	info := &ModelInfo{
++		ID: id, Object: "model", OwnedBy: "antigravity", Type: "antigravity",
++		Name: id, DisplayName: strings.TrimSpace(discovered.DisplayName),
++		Description:   strings.TrimSpace(discovered.DisplayName),
++		ContextLength: max(0, discovered.MaxTokens), MaxCompletionTokens: max(0, discovered.MaxOutputTokens),
++		SupportedInputModalities: []string{"text"}, SupportedOutputModalities: []string{"text"},
++	}
++	inputImage, inputAudio, inputVideo := discovered.SupportsImages || imageGeneration, false, discovered.SupportsVideo
++	for mime, supported := range discovered.SupportedMimeTypes {
++		if !supported {
++			continue
++		}
++		switch {
++		case strings.HasPrefix(mime, "image/"):
++			inputImage = true
++		case strings.HasPrefix(mime, "audio/"):
++			inputAudio = true
++		case strings.HasPrefix(mime, "video/"):
++			inputVideo = true
++		}
++	}
++	if inputImage {
++		info.SupportedInputModalities = append(info.SupportedInputModalities, "image")
++	}
++	if inputAudio {
++		info.SupportedInputModalities = append(info.SupportedInputModalities, "audio")
++	}
++	if inputVideo {
++		info.SupportedInputModalities = append(info.SupportedInputModalities, "video")
++	}
++	if imageGeneration {
++		info.SupportedOutputModalities = append(info.SupportedOutputModalities, "image")
++	}
++	if discovered.SupportsThinking && discovered.MaxOutputTokens > 1 {
++		minimum := 1
++		if discovered.MinThinkingBudget != nil {
++			minimum = max(0, *discovered.MinThinkingBudget)
++		}
++		maximum := discovered.MaxOutputTokens - 1
++		if minimum <= maximum {
++			info.Thinking = &registry.ThinkingSupport{
++				Min: minimum, Max: maximum,
++				ZeroAllowed:    discovered.MinThinkingBudget != nil && minimum == 0,
++				DynamicAllowed: discovered.ThinkingBudget != nil && *discovered.ThinkingBudget == -1,
++			}
++		}
++	}
++	return info
++}
+diff --git a/sdk/cliproxy/antigravity_model_catalog_test.go b/sdk/cliproxy/antigravity_model_catalog_test.go
+new file mode 100644
+index 00000000..02d921e7
+--- /dev/null
++++ b/sdk/cliproxy/antigravity_model_catalog_test.go
+@@ -0,0 +1,169 @@
++package cliproxy
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
++)
++
++func TestAntigravityDiscoveredCatalogEligibilityAndMetadata(t *testing.T) {
++	hints, ok := parseAntigravityModelCapabilityHints([]byte(`{
++		"models": {
++			"gemini-3.8-flash-low": {"displayName":"Gemini 3.8 Flash (Low)","maxTokens":1048576,"maxOutputTokens":65536,"supportsImages":true,"supportsVideo":true,"supportedMimeTypes":{"audio/wav":true},"supportsThinking":true,"minThinkingBudget":0,"thinkingBudget":1000},
++			"gemini-3.8-flash-medium": {"displayName":"Gemini 3.8 Flash (Medium)","maxTokens":1048576,"maxOutputTokens":65536},
++			"gemini-3-flash-agent": {"displayName":"Gemini 3.5 Flash (High)"},
++			"gemini-3.5-flash-extra-low": {"displayName":"Gemini 3.5 Flash (Low)"},
++			"gemini-3.5-flash-low": {"displayName":"Gemini 3.5 Flash (Medium)"},
++			"gemini-2.5-pro": {"displayName":"Gemini 2.5 Pro"},
++			"gemini-2.5-flash": {"displayName":"Gemini 3.5 Flash Lite"},
++			"gemini-2.5-flash-lite": {"displayName":"Gemini 3.5 Flash Lite"},
++			"gemini-2.5-flash-thinking": {"displayName":"Gemini 3.5 Flash Lite"},
++			"gemini-3.1-flash-lite": {"displayName":"wrong upstream metadata","maxTokens":1},
++			"gemini-3.8-flash-tiered": {"displayName":"Tier router"},
++			"chat_20706": {"displayName":"Internal","isInternal":true},
++			"tab_flash_lite_preview": {"displayName":"Editor"},
++			"gemini-private": {"displayName":"Internal","isInternal":true},
++			"gemini-malformed": [],
++			"not-in-static": {},
++			"gemini-tts": {"displayName":"Speech"},
++			"gemini-media": {"displayName":"Speech","supportedOutputModalities":["AUDIO"]},
++			"gemini-image-input": {"displayName":"Image input only"},
++			"gemini-new-image": {"displayName":"New image"},
++			"imagen-4": {"displayName":"Imagen"},
++			"veo-3": {"displayName":"Veo"},
++			"models/proactive-observer-v10": {"displayName":"Transcription"}
++		},
++		"imageGenerationModelIds":["gemini-new-image","imagen-4"],
++		"webSearchModelIds":["gemini-3.8-flash-low"]
++	}`))
++	if !ok {
++		t.Fatal("catalog parse failed")
++	}
++	models := applyAntigravityFetchedModelCapabilities(filterAntigravityModels(registry.GetAntigravityModels(), hints), hints)
++	if len(models) != 11 {
++		t.Fatalf("expected ten discovered models and one predefined model, got %v", models)
++	}
++	byID := make(map[string]*ModelInfo)
++	for _, model := range models {
++		byID[model.ID] = model
++	}
++	low := byID["gemini-3.8-flash-low"]
++	if low == nil || low.ContextLength != 1048576 || low.MaxCompletionTokens != 65536 || !low.SupportsWebSearch {
++		t.Fatalf("lost discovered metadata: %+v", low)
++	}
++	if !reflect.DeepEqual(low.SupportedInputModalities, []string{"text", "image", "audio", "video"}) || !reflect.DeepEqual(low.SupportedOutputModalities, []string{"text"}) {
++		t.Fatalf("input media became generated media: %+v", low)
++	}
++	if low.Thinking == nil || low.Thinking.Max != 65535 || !low.Thinking.ZeroAllowed || low.Thinking.DynamicAllowed {
++		t.Fatalf("incorrect thinking capability: %+v", low.Thinking)
++	}
++	if image := byID["gemini-new-image"]; image == nil || !reflect.DeepEqual(image.SupportedOutputModalities, []string{"text", "image"}) {
++		t.Fatalf("lost image generation capability: %+v", image)
++	}
++	if known := byID["gemini-3.1-flash-lite"]; known == nil || known.ContextLength <= 1 || known.DisplayName == "wrong upstream metadata" {
++		t.Fatalf("predefined metadata overwritten: %+v", known)
++	}
++	for _, id := range []string{"gemini-3.8-flash-tiered", "gemini-private", "gemini-malformed", "gemini-tts", "gemini-media", "chat_20706", "tab_flash_lite_preview", "imagen-4", "veo-3", "models/proactive-observer-v10", "gemini-image-input", "not-in-static"} {
++		if byID[id] != nil {
++			t.Fatalf("published unsupported model %s", id)
++		}
++	}
++}
++
++func TestAntigravityDiscoveredHintsCloneIsolation(t *testing.T) {
++	hints, _ := parseAntigravityModelCapabilityHints([]byte(`{"models":{"gemini-new-image":{"displayName":"Image"}},"imageGenerationModelIds":["gemini-new-image"]}`))
++	clone := hints.clone()
++	clone.Models["gemini-new-image"][0] = '['
++	delete(clone.ImageGenerationModelIDs, "gemini-new-image")
++	if !json.Valid(hints.Models["gemini-new-image"]) || len(hints.ImageGenerationModelIDs) != 1 {
++		t.Fatal("cache snapshot mutated through clone")
++	}
++	delete(hints.ModelIDs, "gemini-new-image")
++	if models := filterAntigravityModels(nil, hints); len(models) != 0 {
++		t.Fatal("unentitled metadata restored a model")
++	}
++}
++
++func TestAntigravityDiscoveredAccountPublicationLifecycle(t *testing.T) {
++	resetAntigravityCapabilityCache()
++	t.Cleanup(resetAntigravityCapabilityCache)
++	const model = "gemini-3.8-flash-low"
++	var catalog atomic.Value
++	catalog.Store(`{"models":{"gemini-3.8-flash-low":{"displayName":"Gemini Low","maxTokens":1048576,"maxOutputTokens":65536}}}`)
++	var status atomic.Int32
++	status.Store(http.StatusOK)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(int(status.Load()))
++		_, _ = w.Write([]byte(catalog.Load().(string)))
++	}))
++	defer server.Close()
++	svc := &Service{
++		cfg:         &config.Config{OAuthModelAlias: map[string][]config.OAuthModelAlias{"antigravity": {{Name: model, Alias: "low-chat"}}}},
++		coreManager: coreauth.NewManager(nil, nil, nil),
++	}
++	auth := antigravityTestAuth("discovered-account", server.URL)
++	auth.Prefix = "tenant"
++	auth, err := svc.coreManager.Register(t.Context(), auth)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
++	svc.registerModelsForAuth(t.Context(), auth)
++	svc.WaitAntigravityProbes()
++	assertPublished := func(want bool) {
++		t.Helper()
++		models := GlobalModelRegistry().GetModelsForClient(auth.ID)
++		if !want {
++			if len(models) != 0 {
++				t.Fatalf("revoked model retained: %v", models)
++			}
++			return
++		}
++		if len(models) != 2 {
++			t.Fatalf("alias and prefix missing: %v", models)
++		}
++		for _, info := range models {
++			if info.ID != "low-chat" && info.ID != "tenant/low-chat" {
++				t.Fatalf("unexpected published route %s", info.ID)
++			}
++		}
++	}
++	assertPublished(true)
++	other := antigravityTestAuth("unentitled-account", server.URL)
++	if models := svc.antigravityModelsForHints(other, antigravityModelCapabilityHints{ModelIDs: map[string]struct{}{}}); len(models) != 0 {
++		t.Fatal("discovered model leaked to another account")
++	}
++	svc.cfg.OAuthExcludedModels = map[string][]string{"antigravity": {model}}
++	if models := svc.antigravityModelsForHints(auth, svc.cachedAntigravityHints(auth)); len(models) != 0 {
++		t.Fatal("discovery bypassed exclusion")
++	}
++	svc.cfg.OAuthExcludedModels = nil
++	expire := func() {
++		antigravityCapabilityMu.Lock()
++		key := svc.antigravityCapabilityKey(auth)
++		entry := antigravityCapabilityCache[key]
++		entry.expiresAt = time.Time{}
++		antigravityCapabilityCache[key] = entry
++		antigravityAuthFailureCache = make(map[string]antigravityFailureState)
++		antigravityCapabilityMu.Unlock()
++	}
++	expire()
++	status.Store(http.StatusForbidden)
++	svc.refreshAntigravityModels(t.Context())
++	svc.WaitAntigravityProbes()
++	assertPublished(true)
++	expire()
++	status.Store(http.StatusOK)
++	catalog.Store(`{"models":{}}`)
++	svc.refreshAntigravityModels(t.Context())
++	svc.WaitAntigravityProbes()
++	assertPublished(false)
++}
+diff --git a/sdk/cliproxy/antigravity_models.go b/sdk/cliproxy/antigravity_models.go
+index b15f19ac..6979c79f 100644
+--- a/sdk/cliproxy/antigravity_models.go
++++ b/sdk/cliproxy/antigravity_models.go
+@@ -87,19 +87,29 @@ var (
+ )
+ 
+ type antigravityFetchAvailableModelsResponse struct {
+-	WebSearchModelIDs []string                   `json:"webSearchModelIds"`
+-	Models            map[string]json.RawMessage `json:"models"`
++	WebSearchModelIDs       []string                   `json:"webSearchModelIds"`
++	ImageGenerationModelIDs []string                   `json:"imageGenerationModelIds"`
++	Models                  map[string]json.RawMessage `json:"models"`
+ }
+ 
+ type antigravityModelCapabilityHints struct {
+ 	WebSearchModelIDs map[string]struct{}
+ 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
+-	ModelIDs map[string]struct{}
+-	revision uint64
++	ModelIDs                map[string]struct{}
++	Models                  map[string]json.RawMessage
++	ImageGenerationModelIDs map[string]struct{}
++	revision                uint64
+ }
+ 
+ func (h antigravityModelCapabilityHints) clone() antigravityModelCapabilityHints {
+-	return antigravityModelCapabilityHints{WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs), ModelIDs: maps.Clone(h.ModelIDs), revision: h.revision}
++	clone := antigravityModelCapabilityHints{
++		WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs), ModelIDs: maps.Clone(h.ModelIDs),
++		ImageGenerationModelIDs: maps.Clone(h.ImageGenerationModelIDs), Models: maps.Clone(h.Models), revision: h.revision,
++	}
++	for id, raw := range clone.Models {
++		clone.Models[id] = bytes.Clone(raw)
++	}
++	return clone
+ }
+ 
+ // antigravityCapabilityKey isolates catalogs by account, project and route, not token lifetime.
+@@ -567,15 +577,24 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
+ 		}
+ 	}
+ 	var modelIDs map[string]struct{}
++	var models map[string]json.RawMessage
+ 	if parsed.Models != nil {
+ 		modelIDs = make(map[string]struct{}, len(parsed.Models))
+-		for id := range parsed.Models {
++		models = make(map[string]json.RawMessage, len(parsed.Models))
++		for id, raw := range parsed.Models {
+ 			if normalized := normalizeAntigravityFetchedModelID(id); normalized != "" {
+ 				modelIDs[normalized] = struct{}{}
++				models[normalized] = raw
+ 			}
+ 		}
+ 	}
+-	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, ModelIDs: modelIDs}, true
++	images := make(map[string]struct{}, len(parsed.ImageGenerationModelIDs))
++	for _, id := range parsed.ImageGenerationModelIDs {
++		if normalized := normalizeAntigravityFetchedModelID(id); normalized != "" {
++			images[normalized] = struct{}{}
++		}
++	}
++	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, ModelIDs: modelIDs, Models: models, ImageGenerationModelIDs: images}, true
+ }
+ 
+ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
+@@ -637,7 +656,7 @@ func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabili
+ 			}
+ 		}
+ 	}
+-	return filtered
++	return appendAntigravityDiscoveredModels(filtered, hints)
+ }
+ 
+ func (s *Service) antigravityModelsForHints(auth *coreauth.Auth, hints antigravityModelCapabilityHints) []*ModelInfo {
+-- 
+2.43.0
+

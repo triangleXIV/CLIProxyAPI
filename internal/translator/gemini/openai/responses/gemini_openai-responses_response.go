@@ -97,6 +97,8 @@ func geminiResponsesTerminalState(finishReason string) (eventType, status string
 	case "MAX_TOKENS":
 		return "response.incomplete", "incomplete", []byte(`{"reason":"max_output_tokens"}`)
 	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL":
+		// A filtered answer is not an empty successful completion. Preserve
+		// the refusal boundary so retry logic does not cool healthy accounts.
 		return "response.incomplete", "incomplete", []byte(`{"reason":"content_filter"}`)
 	default:
 		return "response.completed", "completed", nil

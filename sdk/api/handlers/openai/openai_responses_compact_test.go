@@ -205,7 +205,7 @@ func (e *compactFailureMockExecutor) Execute(ctx context.Context, auth *coreauth
 	}
 	respPayload := e.normalResp
 	if len(respPayload) == 0 {
-		respPayload = []byte(`{"id":"resp_123","object":"response","status":"completed"}`)
+		respPayload = []byte(`{"id":"resp_123","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`)
 	}
 	return coreexecutor.Response{Payload: respPayload}, nil
 }

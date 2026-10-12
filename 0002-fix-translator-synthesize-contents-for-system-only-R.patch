@@ -1,0 +1,111 @@
+From 7f1f02f0e0eb906853bd063502b4595b9c941652 Mon Sep 17 00:00:00 2001
+From: triangleXIV <triangleXIV@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 20:08:56 +0800
+Subject: [PATCH 2/8] fix(translator): synthesize contents for system-only
+ Responses input
+
+A Responses request whose input carries only a system/developer
+message put all conversation text into systemInstruction and left
+contents empty, so the upstream rejected it with 400
+
+    GenerateContentRequest.contents: contents is not specified
+
+RimWorld-style game clients send exactly this shape (one big roleplay
+system prompt, no user turn). When contents ends up empty while
+systemInstruction still has text, move the system text into a single
+user turn instead of forwarding an empty conversation.
+---
+ .../gemini_openai-responses_request.go        | 33 ++++++++++++++++++-
+ .../gemini_openai-responses_request_test.go   | 28 +++++++++++++++-
+ 2 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+index 4d38486b..5e023020 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+@@ -522,7 +522,38 @@ func convertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
+ 	if useGeminiNativeReasoningLayout {
+ 		result = sigcompat.SanitizeGeminiRequestThoughtSignatures(result, "contents")
+ 	}
+-	return stripTrailingOpenAIResponsesModelPrefill(result), drops.Err()
++	result = stripTrailingOpenAIResponsesModelPrefill(result)
++	result = ensureResponsesContentsPresent(result)
++	return result, drops.Err()
++}
++
++// ensureResponsesContentsPresent guards against requests whose input carried
++// only system/developer messages: the conversation text ends up in
++// systemInstruction while contents stays empty, and the upstream rejects the
++// request with 400 "contents is not specified". In that case move the system
++// text into a single user turn so the model has something to answer.
++func ensureResponsesContentsPresent(payload []byte) []byte {
++	contents := gjson.GetBytes(payload, "contents")
++	if contents.IsArray() && len(contents.Array()) > 0 {
++		return payload
++	}
++	sys := gjson.GetBytes(payload, "systemInstruction")
++	if !sys.IsObject() {
++		return payload
++	}
++	var parts [][]byte
++	sys.Get("parts").ForEach(func(_, p gjson.Result) bool {
++		if p.Get("text").Exists() && strings.TrimSpace(p.Get("text").String()) != "" {
++			parts = append(parts, []byte(p.Raw))
++		}
++		return true
++	})
++	if len(parts) == 0 {
++		return payload
++	}
++	updated := translatorcommon.SetRawArrayItems(payload, "contents", [][]byte{geminiContent("user", parts)})
++	updated, _ = sjson.DeleteBytes(updated, "systemInstruction")
++	return updated
+ }
+ 
+ func geminiContent(role string, parts [][]byte) []byte {
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+index e8f3bd33..c3d53fc4 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+@@ -3582,7 +3582,6 @@ func TestConvertOpenAIResponsesRequestToGemini_UnsignedModelTextDoesNotSynthesiz
+ 	}
+ }
+ 
+-
+ func TestConvertOpenAIResponsesRequestToGemini_AssistantOnlyInputKeepsContents(t *testing.T) {
+ 	inputJSON := `{
+ 		"model":"gemini-3.8-flash-high",
+@@ -3624,3 +3623,30 @@ func TestConvertOpenAIResponsesRequestToGemini_StripsTrailingAssistantPrefillWhe
+ 		t.Fatalf("remaining role = %q, want user", contents[0].Get("role").String())
+ 	}
+ }
++
++func TestConvertOpenAIResponsesRequestToGemini_SystemOnlyInputSynthesizesContents(t *testing.T) {
++	inputJSON := `{
++		"model":"gemini-3.8-flash-high",
++		"input":[
++			{"type":"message","role":"system","content":"You are a game NPC. Greet the player."}
++		]
++	}`
++	result, err := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(inputJSON), false)
++	if err != nil {
++		t.Fatalf("convert: %v", err)
++	}
++	contents := gjson.GetBytes(result, "contents").Array()
++	if len(contents) == 0 {
++		t.Fatalf("contents empty for system-only input: %s", result)
++	}
++	first := contents[0]
++	if first.Get("role").String() != "user" {
++		t.Fatalf("synthesized role = %q, want user", first.Get("role").String())
++	}
++	if !strings.Contains(first.Get("parts.0.text").String(), "game NPC") {
++		t.Fatalf("system text missing from synthesized turn: %s", first.Raw)
++	}
++	if gjson.GetBytes(result, "systemInstruction").Exists() {
++		t.Fatalf("systemInstruction should be moved into contents, not duplicated")
++	}
++}
+-- 
+2.43.0
+

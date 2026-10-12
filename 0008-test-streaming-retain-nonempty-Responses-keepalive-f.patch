@@ -1,0 +1,34 @@
+From 95b0ced5bf6e940a1f0f2f8c009402e24cb79dbc Mon Sep 17 00:00:00 2001
+From: triangleXIV <127415617+triangleXIV@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:27:50 +0800
+Subject: [PATCH 8/8] test(streaming): retain nonempty Responses keepalive
+ fixture
+
+---
+ .../openai/openai_responses_handlers_stream_error_test.go      | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/sdk/api/handlers/openai/openai_responses_handlers_stream_error_test.go b/sdk/api/handlers/openai/openai_responses_handlers_stream_error_test.go
+index 4674f3ee..4b599d2c 100644
+--- a/sdk/api/handlers/openai/openai_responses_handlers_stream_error_test.go
++++ b/sdk/api/handlers/openai/openai_responses_handlers_stream_error_test.go
+@@ -1004,6 +1004,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
+ 		go func() {
+ 			tickChan <- time.Unix(1, 0)
+ 			tickChan <- time.Unix(2, 0)
++			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n")}
+ 			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n")}
+ 			close(chunks)
+ 		}()
+@@ -1026,7 +1027,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
+ 			t.Fatalf("status = %d, want 200; body=%q", recorder.Code, recorder.Body.String())
+ 		}
+ 		body := recorder.Body.String()
+-		if !strings.HasPrefix(body, ": keep-alive\n\n") || !strings.Contains(body, "event: response.completed") {
++		if !strings.HasPrefix(body, ": keep-alive\n\n") || !strings.Contains(body, `"delta":"OK"`) || !strings.Contains(body, "event: response.completed") {
+ 			t.Fatalf("unexpected stream body: %q", body)
+ 		}
+ 	})
+-- 
+2.43.0
+

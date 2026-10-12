@@ -630,6 +630,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
+			// Empty completions must surface before the success result is
+			// built: converting the payload to an upstream attempt error
+			// here lets the regular error path record the result and rotate
+			// to the next auth.
+			if errExec == nil && isEmptyCompletionPayload(resp.Payload) {
+				errExec = markUpstreamExecutionAttemptFromContext(execCtx, errEmptyCompletion)
+				if hasUpstreamExecutionAttempt(errExec) {
+					upstreamErr = errExec
+				}
+				warnLogUpstreamFailure(execCtx, entry, provider, upstreamModel, auth, durationExec, errExec)
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: execOpts, AccessToken: authAccessTokenForRequest(execCtx, auth, execOpts.Headers), CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch, ExecutionSeq: executionSeq}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
@@ -662,13 +673,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				if result.CredentialScope {
 					break
-				}
-				continue
-			}
-			if isEmptyCompletionPayload(resp.Payload) {
-				lastErr = m.markEmptyCompletion(execCtx, &result)
-				if homeMode {
-					homeAuthCount++
 				}
 				continue
 			}

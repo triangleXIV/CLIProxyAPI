@@ -1,0 +1,109 @@
+From 772065dd0297fbbe1d3dc29e592fb06f3e00e88a Mon Sep 17 00:00:00 2001
+From: triangleXIV <triangleXIV@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 19:47:31 +0800
+Subject: [PATCH 1/8] fix(translator): keep assistant-only Responses input
+ callable
+
+An OpenAI Responses request whose input contains only assistant
+message(s) was translated into a Gemini GenerateContent request whose
+trailing model turn got stripped by the prefill sanitizer, leaving an
+empty contents array. The upstream then rejected it with 400
+
+    GenerateContentRequest.contents: contents is not specified
+
+Keeping the single model turn is not enough because the upstream also
+rejects requests that end with a model turn (400 "Requests ending
+with a model turn are not supported").
+
+When stripping the trailing model prefill would leave contents empty,
+rewrite the single remaining turn as a user turn instead, so the
+conversation stays valid and callable.
+
+Verified against the Antigravity upstream: assistant-only input now
+returns 200 with a normal completion; user+assistant prefill is still
+stripped as before; empty input still fails with the upstream 400.
+---
+ .../gemini_openai-responses_request.go        | 15 ++++---
+ .../gemini_openai-responses_request_test.go   | 43 +++++++++++++++++++
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+index 5cf785df..4d38486b 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+@@ -590,11 +590,16 @@ func stripTrailingOpenAIResponsesModelPrefill(payload []byte) []byte {
+ 		items = append(items, []byte(content.Raw))
+ 	}
+ 	if len(items) == 0 {
+-		updated, errSet := sjson.SetRawBytes(payload, "contents", []byte("[]"))
+-		if errSet == nil {
+-			return updated
+-		}
+-		return payload
++		// The trailing model turn is the only content; stripping it would
++		// leave an empty contents array, which the upstream rejects with
++		// "contents is not specified", while keeping it makes the request
++		// end with a model turn, which the upstream also rejects. Rewrite
++		// the single turn as a user turn so the request stays valid.
++		rewritten, errRole := sjson.SetBytes([]byte(contentArray[len(contentArray)-1].Raw), "role", "user")
++		if errRole != nil {
++			return payload
++		}
++		return translatorcommon.SetRawArrayItems(payload, "contents", [][]byte{rewritten})
+ 	}
+ 	return translatorcommon.SetRawArrayItems(payload, "contents", items)
+ }
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+index a56a8ac3..e8f3bd33 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+@@ -3581,3 +3581,46 @@ func TestConvertOpenAIResponsesRequestToGemini_UnsignedModelTextDoesNotSynthesiz
+ 		t.Fatalf("sanitizer left unexpected thoughtSignature on text part: %s", sanitizedParts[1].Raw)
+ 	}
+ }
++
++
++func TestConvertOpenAIResponsesRequestToGemini_AssistantOnlyInputKeepsContents(t *testing.T) {
++	inputJSON := `{
++		"model":"gemini-3.8-flash-high",
++		"input":[
++			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefill only turn"}]}
++		]
++	}`
++	result, err := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(inputJSON), false)
++	if err != nil {
++		t.Fatalf("convert: %v", err)
++	}
++	contents := gjson.GetBytes(result, "contents").Array()
++	if len(contents) == 0 {
++		t.Fatalf("contents empty for assistant-only input: %s", result)
++	}
++	last := contents[len(contents)-1]
++	if last.Get("role").String() != "user" {
++		t.Fatalf("single assistant-only turn must be rewritten as user, got role=%q", last.Get("role").String())
++	}
++	if last.Get("parts.0.text").String() != "prefill only turn" {
++		t.Fatalf("rewritten turn lost its text: %s", last.Raw)
++	}
++}
++
++func TestConvertOpenAIResponsesRequestToGemini_StripsTrailingAssistantPrefillWhenUserPresent(t *testing.T) {
++	inputJSON := `{
++		"model":"gemini-3.8-flash-high",
++		"input":[
++			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
++			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefill"}]}
++		]
++	}`
++	result, _ := ConvertOpenAIResponsesRequestToGemini("gemini-3.8-flash-high", []byte(inputJSON), false)
++	contents := gjson.GetBytes(result, "contents").Array()
++	if len(contents) != 1 {
++		t.Fatalf("contents len = %d, want 1 (trailing prefill stripped)", len(contents))
++	}
++	if contents[0].Get("role").String() != "user" {
++		t.Fatalf("remaining role = %q, want user", contents[0].Get("role").String())
++	}
++}
+-- 
+2.43.0
+

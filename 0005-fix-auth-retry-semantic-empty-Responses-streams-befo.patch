@@ -1,0 +1,600 @@
+From 2f2e6852f52a96c356ffa483df51347aef9c9326 Mon Sep 17 00:00:00 2001
+From: triangleXIV <127415617+triangleXIV@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 10:39:12 +0800
+Subject: [PATCH 5/8] fix(auth): retry semantic empty Responses streams before
+ committing headers
+
+---
+ .../responses/empty_completion_filter_test.go |  27 +++
+ .../gemini_openai-responses_response.go       |   7 +-
+ .../handlers_stream_bootstrap_test.go         |   2 +-
+ sdk/api/handlers/model_execution_test.go      |   2 +-
+ .../openai/openai_responses_compact_test.go   |   2 +-
+ .../permanent_oauth_classification_test.go    |   2 +-
+ .../auth/api_key_model_capabilities_test.go   |   2 +-
+ sdk/cliproxy/auth/conductor_execution.go      |  14 +-
+ .../auth/conductor_executor_replace_test.go   |   2 +-
+ sdk/cliproxy/auth/conductor_stream.go         |  16 +-
+ sdk/cliproxy/auth/empty_completion.go         |  16 +-
+ .../auth/empty_completion_openai_test.go      |   4 +-
+ .../auth/empty_completion_responses.go        | 142 ++++++++++++++++
+ .../auth/empty_completion_responses_test.go   | 155 ++++++++++++++++++
+ 14 files changed, 361 insertions(+), 32 deletions(-)
+ create mode 100644 internal/translator/gemini/openai/responses/empty_completion_filter_test.go
+ create mode 100644 sdk/cliproxy/auth/empty_completion_responses.go
+ create mode 100644 sdk/cliproxy/auth/empty_completion_responses_test.go
+
+diff --git a/internal/translator/gemini/openai/responses/empty_completion_filter_test.go b/internal/translator/gemini/openai/responses/empty_completion_filter_test.go
+new file mode 100644
+index 00000000..35f1612b
+--- /dev/null
++++ b/internal/translator/gemini/openai/responses/empty_completion_filter_test.go
+@@ -0,0 +1,27 @@
++package responses
++
++import (
++	"context"
++	"fmt"
++	"testing"
++
++	"github.com/tidwall/gjson"
++)
++
++func TestGeminiResponsesContentFilterIsNotSuccessfulEmptyCompletion(t *testing.T) {
++	for _, reason := range []string{"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY"} {
++		t.Run(reason, func(t *testing.T) {
++			raw := fmt.Sprintf(`{"candidates":[{"finishReason":%q}],"usageMetadata":{"candidatesTokenCount":0}}`, reason)
++			out := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "gemini-3.8-flash-high", nil, nil, []byte(raw), nil)
++			if gjson.GetBytes(out, "status").String() != "incomplete" || gjson.GetBytes(out, "incomplete_details.reason").String() != "content_filter" {
++				t.Fatalf("filtered non-stream output = %s", out)
++			}
++			var param any
++			events := issue6258Translate(t, &param, raw)
++			terminal := issue6258Terminal(t, events)
++			if terminal.Get("status").String() != "incomplete" || terminal.Get("incomplete_details.reason").String() != "content_filter" {
++				t.Fatalf("filtered stream output = %s", terminal.Raw)
++			}
++		})
++	}
++}
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
+index 1b5aa503..4afaf4d0 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
+@@ -93,8 +93,13 @@ func (usage geminiResponsesUsage) JSON() []byte {
+ }
+ 
+ func geminiResponsesTerminalState(finishReason string) (eventType, status string, incompleteDetails []byte) {
+-	if strings.EqualFold(strings.TrimSpace(finishReason), "MAX_TOKENS") {
++	switch strings.ToUpper(strings.TrimSpace(finishReason)) {
++	case "MAX_TOKENS":
+ 		return "response.incomplete", "incomplete", []byte(`{"reason":"max_output_tokens"}`)
++	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY":
++		// A filtered answer is not an empty successful completion. Preserve
++		// the refusal boundary so retry logic does not cool healthy accounts.
++		return "response.incomplete", "incomplete", []byte(`{"reason":"content_filter"}`)
+ 	}
+ 	return "response.completed", "completed", nil
+ }
+diff --git a/sdk/api/handlers/handlers_stream_bootstrap_test.go b/sdk/api/handlers/handlers_stream_bootstrap_test.go
+index 15a15c1d..53a6711d 100644
+--- a/sdk/api/handlers/handlers_stream_bootstrap_test.go
++++ b/sdk/api/handlers/handlers_stream_bootstrap_test.go
+@@ -562,7 +562,7 @@ func TestExecuteStreamWithAuthManager_ResetsResponsesValidatorOnBootstrapRetry(t
+ 			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",")}
+ 			chunks <- coreexecutor.StreamChunk{Err: &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}}
+ 		} else {
+-			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")}
++			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n")}
+ 		}
+ 		close(chunks)
+ 		return &coreexecutor.StreamResult{Chunks: chunks}, nil
+diff --git a/sdk/api/handlers/model_execution_test.go b/sdk/api/handlers/model_execution_test.go
+index bf8dbe2d..27a9df3f 100644
+--- a/sdk/api/handlers/model_execution_test.go
++++ b/sdk/api/handlers/model_execution_test.go
+@@ -611,7 +611,7 @@ func TestExecuteModelStreamKeepsInteractionsProviderForOpenAIEntry(t *testing.T)
+ 		provider: constant.GeminiInteractions,
+ 		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+ 			chunks := make(chan coreexecutor.StreamChunk, 1)
+-			chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"id":"chunk_1","object":"chat.completion.chunk","choices":[]}`)}
++			chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"id":"chunk_1","object":"chat.completion.chunk","choices":[{"delta":{"content":"ok"}}]}`)}
+ 			close(chunks)
+ 			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+ 		},
+diff --git a/sdk/api/handlers/openai/openai_responses_compact_test.go b/sdk/api/handlers/openai/openai_responses_compact_test.go
+index 64cc91ca..c08d76a0 100644
+--- a/sdk/api/handlers/openai/openai_responses_compact_test.go
++++ b/sdk/api/handlers/openai/openai_responses_compact_test.go
+@@ -205,7 +205,7 @@ func (e *compactFailureMockExecutor) Execute(ctx context.Context, auth *coreauth
+ 	}
+ 	respPayload := e.normalResp
+ 	if len(respPayload) == 0 {
+-		respPayload = []byte(`{"id":"resp_123","object":"response","status":"completed"}`)
++		respPayload = []byte(`{"id":"resp_123","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`)
+ 	}
+ 	return coreexecutor.Response{Payload: respPayload}, nil
+ }
+diff --git a/sdk/api/handlers/openai/permanent_oauth_classification_test.go b/sdk/api/handlers/openai/permanent_oauth_classification_test.go
+index 04b9e6d5..ad4757cd 100644
+--- a/sdk/api/handlers/openai/permanent_oauth_classification_test.go
++++ b/sdk/api/handlers/openai/permanent_oauth_classification_test.go
+@@ -21,7 +21,7 @@ import (
+ )
+ 
+ const reproOAuthMessage = `token refresh failed with status 401: {"error":{"message":"Refresh credential has already been consumed; sign in again.","type":"invalid_request_error","code":"refresh_token_reused"}}`
+-const reproCompletedResponse = `{"id":"resp-fixture","object":"response","status":"completed","output":[]}`
++const reproCompletedResponse = `{"id":"resp-fixture","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`
+ 
+ type reproOAuthExecutor struct{ calls atomic.Int32 }
+ 
+diff --git a/sdk/cliproxy/auth/api_key_model_capabilities_test.go b/sdk/cliproxy/auth/api_key_model_capabilities_test.go
+index 79adb8b2..ac903c77 100644
+--- a/sdk/cliproxy/auth/api_key_model_capabilities_test.go
++++ b/sdk/cliproxy/auth/api_key_model_capabilities_test.go
+@@ -411,7 +411,7 @@ func (e *selectedCapabilityCaptureExecutor) Identifier() string { return e.provi
+ 
+ func (e *selectedCapabilityCaptureExecutor) Execute(_ context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+ 	e.requests = append(e.requests, req)
+-	return cliproxyexecutor.Response{}, nil
++	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
+ }
+ 
+ func (e *selectedCapabilityCaptureExecutor) ExecuteStream(_ context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+diff --git a/sdk/cliproxy/auth/conductor_execution.go b/sdk/cliproxy/auth/conductor_execution.go
+index f1bad7de..c625fc76 100644
+--- a/sdk/cliproxy/auth/conductor_execution.go
++++ b/sdk/cliproxy/auth/conductor_execution.go
+@@ -628,6 +628,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+ 				return cliproxyexecutor.Response{}, errCancel
+ 			}
++			if errExec == nil && isEmptyCompletionPayload(resp.Payload) {
++				errExec = markUpstreamExecutionAttemptFromContext(execCtx, errEmptyCompletion)
++				if hasUpstreamExecutionAttempt(errExec) {
++					upstreamErr = errExec
++				}
++				warnLogUpstreamFailure(execCtx, entry, provider, upstreamModel, auth, durationExec, errExec)
++			}
+ 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: execOpts, CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch}
+ 			if errExec != nil {
+ 				result.Error = resultErrorFromError(errExec)
+@@ -663,13 +670,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 				}
+ 				continue
+ 			}
+-			if isEmptyCompletionPayload(resp.Payload) {
+-				lastErr = m.markEmptyCompletion(execCtx, &result)
+-				if homeMode {
+-					homeAuthCount++
+-				}
+-				continue
+-			}
+ 			m.MarkResult(execCtx, result)
+ 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
+ 			rewriteForceMappedResponse(&resp, attemptAliasResult)
+diff --git a/sdk/cliproxy/auth/conductor_executor_replace_test.go b/sdk/cliproxy/auth/conductor_executor_replace_test.go
+index 9354c61c..b21ad3f0 100644
+--- a/sdk/cliproxy/auth/conductor_executor_replace_test.go
++++ b/sdk/cliproxy/auth/conductor_executor_replace_test.go
+@@ -123,7 +123,7 @@ type refreshMockExecutor struct {
+ 
+ func (e *refreshMockExecutor) Identifier() string { return e.id }
+ func (e *refreshMockExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+-	return cliproxyexecutor.Response{}, nil
++	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
+ }
+ func (e *refreshMockExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+ 	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+diff --git a/sdk/cliproxy/auth/conductor_stream.go b/sdk/cliproxy/auth/conductor_stream.go
+index 9558f813..a5eb15a2 100644
+--- a/sdk/cliproxy/auth/conductor_stream.go
++++ b/sdk/cliproxy/auth/conductor_stream.go
+@@ -93,6 +93,8 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
+ 		return nil, true, nil
+ 	}
+ 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
++	var completion emptyCompletionAccum
++	bufferedBytes := 0
+ 	for {
+ 		var (
+ 			chunk cliproxyexecutor.StreamChunk
+@@ -114,14 +116,24 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
+ 			chunk, ok = <-ch
+ 		}
+ 		if !ok {
++			if completion.empty() {
++				return nil, true, errEmptyCompletion
++			}
+ 			return buffered, true, nil
+ 		}
+ 		if chunk.Err != nil {
+ 			return nil, false, chunk.Err
+ 		}
+-		buffered = append(buffered, chunk)
+ 		if len(chunk.Payload) > 0 {
+-			return buffered, false, nil
++			buffered = append(buffered, chunk)
++			completion.observe(chunk.Payload)
++			bufferedBytes += len(chunk.Payload)
++			// Do not commit headers for role/created/signature-only prefixes.
++			// Bound buffering without adding a network deadline, and preserve
++			// unknown output formats byte-for-byte.
++			if completion.ready() || bufferedBytes >= 1<<20 || len(buffered) >= 1024 {
++				return buffered, false, nil
++			}
+ 		}
+ 	}
+ }
+diff --git a/sdk/cliproxy/auth/empty_completion.go b/sdk/cliproxy/auth/empty_completion.go
+index fac5adde..9680e950 100644
+--- a/sdk/cliproxy/auth/empty_completion.go
++++ b/sdk/cliproxy/auth/empty_completion.go
+@@ -2,7 +2,6 @@ package auth
+ 
+ import (
+ 	"bytes"
+-	"context"
+ 	"encoding/json"
+ 	"io"
+ 	"math"
+@@ -257,8 +256,7 @@ func isMeaningfulToolCall(raw json.RawMessage) bool {
+ }
+ 
+ // emptyCompletionAccum accumulates the properties relevant to deciding whether
+-// an OpenAI-style completion is empty. Later slices add Claude/Gemini/Responses
+-// evaluators onto the same accum; unused format flags are omitted here.
++// an OpenAI Chat Completions or Responses completion is empty.
+ type emptyCompletionAccum struct {
+ 	expectedChoices       int
+ 	recognized            bool
+@@ -283,7 +281,7 @@ func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
+ 	}
+ 	recognized := false
+ 	for _, v := range values {
+-		if a.evalOpenAI(v) {
++		if a.evalOpenAI(v) || a.evalResponses(v) {
+ 			recognized = true
+ 		} else {
+ 			a.sawUnknownData = true
+@@ -590,13 +588,3 @@ func (a *emptyCompletionAccum) evalSSE(payload []byte) {
+ 	}
+ 	flush()
+ }
+-
+-// markEmptyCompletion records a failed retriable empty-completion result and
+-// returns the error to propagate. The mixed duty execution path rotates on an
+-// empty completion; the home (credits) path reports it via reportHomeResult.
+-func (m *Manager) markEmptyCompletion(ctx context.Context, result *Result) error {
+-	result.Success = false
+-	result.Error = errEmptyCompletion
+-	m.MarkResult(ctx, *result)
+-	return errEmptyCompletion
+-}
+diff --git a/sdk/cliproxy/auth/empty_completion_openai_test.go b/sdk/cliproxy/auth/empty_completion_openai_test.go
+index c48d7839..227bf609 100644
+--- a/sdk/cliproxy/auth/empty_completion_openai_test.go
++++ b/sdk/cliproxy/auth/empty_completion_openai_test.go
+@@ -8,8 +8,8 @@ import (
+ 	"testing"
+ 
+ 	"github.com/google/uuid"
+-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+ )
+ 
+ // openaiEmptyTestExecutor returns an empty OpenAI chat-completion payload from
+diff --git a/sdk/cliproxy/auth/empty_completion_responses.go b/sdk/cliproxy/auth/empty_completion_responses.go
+new file mode 100644
+index 00000000..975498a3
+--- /dev/null
++++ b/sdk/cliproxy/auth/empty_completion_responses.go
+@@ -0,0 +1,142 @@
++package auth
++
++import (
++	"encoding/json"
++	"strings"
++)
++
++type completionResponse struct {
++	Object string            `json:"object"`
++	Status string            `json:"status"`
++	Error  json.RawMessage   `json:"error"`
++	Output []json.RawMessage `json:"output"`
++	Usage  *struct {
++		OutputTokens tokenCount `json:"output_tokens"`
++	} `json:"usage"`
++}
++
++// evalResponses recognizes only known Responses envelopes. Unknown events and
++// output item types remain pass-through, rather than risking a false retry.
++func (a *emptyCompletionAccum) evalResponses(data []byte) bool {
++	var event struct {
++		Type     string              `json:"type"`
++		Object   string              `json:"object"`
++		Response *completionResponse `json:"response"`
++		Item     json.RawMessage     `json:"item"`
++		Part     json.RawMessage     `json:"part"`
++		Delta    json.RawMessage     `json:"delta"`
++		Text     string              `json:"text"`
++	}
++	if json.Unmarshal(data, &event) != nil || (event.Object != "response" && !strings.HasPrefix(event.Type, "response.")) {
++		return false
++	}
++	a.recognized = true
++	a.sawMessageData = true
++	if event.Object == "response" {
++		event.Response = &completionResponse{}
++		if json.Unmarshal(data, event.Response) != nil {
++			a.sawUnknownData = true
++			return true
++		}
++	} else {
++		switch event.Type {
++		case "response.created", "response.in_progress", "response.completed", "response.incomplete", "response.failed":
++			if event.Response == nil {
++				a.sawUnknownData = true
++			}
++		case "response.output_item.added", "response.output_item.done", "response.content_part.added", "response.content_part.done", "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
++			if len(event.Item) == 0 && len(event.Part) == 0 {
++				a.sawUnknownData = true
++			}
++		case "response.output_text.delta", "response.output_text.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_text.delta", "response.reasoning_text.done", "response.refusal.delta", "response.refusal.done", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
++			var delta string
++			if len(event.Delta) > 0 && json.Unmarshal(event.Delta, &delta) != nil {
++				a.sawUnknownData = true
++			}
++			if strings.TrimSpace(delta+event.Text) != "" {
++				a.hasContent = true
++			}
++		default:
++			a.sawUnknownData = true
++		}
++	}
++	if event.Response != nil {
++		response := event.Response
++		if response.Object != "response" && response.Status == "" {
++			a.sawUnknownData = true
++		}
++		if response.Usage != nil {
++			a.sawUsage = true
++			a.addUsage(response.Usage.OutputTokens)
++		}
++		if response.Status == "completed" || event.Type == "response.completed" {
++			a.terminal = true
++		}
++		if response.Status == "incomplete" || response.Status == "failed" || event.Type == "response.incomplete" || event.Type == "response.failed" || nonEmptyJSONPayload(response.Error) {
++			// Preserve failures and token-limit stops for their normal handlers.
++			a.blocked = true
++		}
++		for _, item := range response.Output {
++			a.evalResponseItem(item)
++		}
++	}
++	if len(event.Item) > 0 {
++		a.evalResponseItem(event.Item)
++	}
++	if len(event.Part) > 0 {
++		a.evalResponseItem(event.Part)
++	}
++	return true
++}
++
++func (a *emptyCompletionAccum) evalResponseItem(raw json.RawMessage) {
++	var item struct {
++		Type             string            `json:"type"`
++		Text             string            `json:"text"`
++		Refusal          string            `json:"refusal"`
++		EncryptedContent string            `json:"encrypted_content"`
++		Content          []json.RawMessage `json:"content"`
++		Summary          []json.RawMessage `json:"summary"`
++		Result           json.RawMessage   `json:"result"`
++	}
++	if json.Unmarshal(raw, &item) != nil {
++		a.sawUnknownData = true
++		return
++	}
++	switch item.Type {
++	case "message", "reasoning", "output_text", "summary_text", "reasoning_text", "refusal":
++		if strings.TrimSpace(item.Text+item.Refusal) != "" {
++			a.hasContent = true
++		}
++		if encrypted := strings.TrimSpace(item.EncryptedContent); encrypted != "" && !strings.HasPrefix(encrypted, "cpa-gemini-responses-carrier-v1:") {
++			// Opaque provider reasoning may contain real encrypted output. A
++			// Gemini replay carrier alone, however, is only a signature.
++			a.hasContent = true
++		}
++		for _, part := range append(item.Content, item.Summary...) {
++			a.evalResponseItem(part)
++		}
++	case "function_call", "custom_tool_call":
++		if isMeaningfulToolCall(raw) {
++			a.hasToolCalls = true
++		}
++	case "image_generation_call":
++		if nonEmptyJSONPayload(item.Result) {
++			a.hasContent = true
++		}
++	default:
++		a.sawUnknownData = true
++	}
++}
++
++func (a *emptyCompletionAccum) observe(payload []byte) {
++	if isSSEPayload(payload) {
++		a.evalSSE(payload)
++	} else if !a.evalJSON(payload) {
++		a.sawUnknownData = true
++	}
++}
++
++func (a *emptyCompletionAccum) ready() bool {
++	return a.sawUnknownData || a.blocked || a.hasContent || a.hasToolCalls || a.completionTokens > 0
++}
+diff --git a/sdk/cliproxy/auth/empty_completion_responses_test.go b/sdk/cliproxy/auth/empty_completion_responses_test.go
+new file mode 100644
+index 00000000..626677b0
+--- /dev/null
++++ b/sdk/cliproxy/auth/empty_completion_responses_test.go
+@@ -0,0 +1,155 @@
++package auth
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++)
++
++func completionChunks(payloads ...string) <-chan cliproxyexecutor.StreamChunk {
++	ch := make(chan cliproxyexecutor.StreamChunk, len(payloads))
++	for _, payload := range payloads {
++		ch <- cliproxyexecutor.StreamChunk{Payload: []byte(payload)}
++	}
++	close(ch)
++	return ch
++}
++
++func TestReadStreamBootstrapRejectsSemanticEmptyCompletion(t *testing.T) {
++	tests := []struct {
++		name     string
++		payloads []string
++	}{
++		{"responses", []string{`event: response.created
++data: {"type":"response.created","response":{"object":"response","status":"in_progress","output":[]}}
++
++`, `event: response.completed
++data: {"type":"response.completed","response":{"object":"response","status":"completed","output":[],"usage":{"output_tokens":0}}}
++
++`}},
++		{"chat role then stop", []string{`{"choices":[{"delta":{"role":"assistant"}}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}`}},
++		{"header only EOF", []string{`{"type":"response.created","response":{"object":"response","status":"in_progress","output":[]}}`}},
++		{"DONE only", []string{"data: [DONE]\n\n"}},
++		{"Gemini signature only", []string{`{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"cpa-gemini-responses-carrier-v1:signature","summary":[]}}`, `{"type":"response.completed","response":{"object":"response","status":"completed","output":[{"type":"reasoning","encrypted_content":"cpa-gemini-responses-carrier-v1:signature","summary":[]}],"usage":{"output_tokens":0}}}`}},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			_, _, err := readStreamBootstrap(context.Background(), completionChunks(tt.payloads...))
++			var authErr *Error
++			if !errors.As(err, &authErr) || authErr.Code != "empty_completion" {
++				t.Fatalf("bootstrap error = %v, want empty_completion", err)
++			}
++		})
++	}
++}
++
++func TestReadStreamBootstrapReleasesFirstContentBeforeEOF(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	ch := make(chan cliproxyexecutor.StreamChunk)
++	prefix := `{"type":"response.created","response":{"object":"response","status":"in_progress","output":[]}}`
++	content := `{"type":"response.output_text.delta","delta":"hello"}`
++	go func() {
++		defer close(ch)
++		for _, payload := range []string{prefix, content} {
++			select {
++			case ch <- cliproxyexecutor.StreamChunk{Payload: []byte(payload)}:
++			case <-ctx.Done():
++				return
++			}
++		}
++		// The upstream stays open until bootstrap returns and cancels it.
++		<-ctx.Done()
++	}()
++	buffered, closed, err := readStreamBootstrap(ctx, ch)
++	if err != nil || closed || len(buffered) != 2 || string(buffered[0].Payload) != prefix || string(buffered[1].Payload) != content {
++		t.Fatalf("bootstrap = %v, closed=%v, err=%v", buffered, closed, err)
++	}
++}
++
++func TestReadStreamBootstrapHonorsClientCancellation(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	ch := make(chan cliproxyexecutor.StreamChunk, 1)
++	ch <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"choices":[{"delta":{"role":"assistant"}}]}`)}
++	cancel()
++	_, _, err := readStreamBootstrap(ctx, ch)
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("bootstrap error = %v, want context.Canceled", err)
++	}
++}
++
++func TestEmptyResponsesCompletionPayload(t *testing.T) {
++	for _, payload := range []string{
++		`{"object":"response","status":"completed","output":[],"usage":{"output_tokens":0}}`,
++		`{"object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"  "}]}]}`,
++	} {
++		if !isEmptyCompletionPayload([]byte(payload)) {
++			t.Fatalf("response should be empty: %s", payload)
++		}
++	}
++}
++
++func TestReadStreamBootstrapPreservesMeaningfulAndBlockedOutput(t *testing.T) {
++	for name, payload := range map[string]string{
++		"text":                       `{"type":"response.output_text.delta","delta":"hello"}`,
++		"reasoning":                  `{"type":"response.reasoning_summary_text.delta","delta":"thinking"}`,
++		"tool":                       `{"type":"response.output_item.added","item":{"type":"function_call","name":"lookup","arguments":""}}`,
++		"image":                      `{"object":"response","status":"completed","output":[{"type":"image_generation_call","result":"image-bytes"}]}`,
++		"positive usage":             `{"type":"response.completed","response":{"object":"response","status":"completed","output":[],"usage":{"output_tokens":2}}}`,
++		"incomplete":                 `{"type":"response.incomplete","response":{"object":"response","status":"incomplete","output":[]}}`,
++		"refusal":                    `{"type":"response.refusal.delta","delta":"cannot comply"}`,
++		"content filter":             `{"choices":[{"delta":{},"finish_reason":"content_filter"}]}`,
++		"length":                     `{"choices":[{"delta":{},"finish_reason":"length"}]}`,
++		"opaque encrypted reasoning": `{"object":"response","status":"completed","output":[{"type":"reasoning","encrypted_content":"opaque-codex-value"}]}`,
++		"unknown format":             `{"type":"new_provider_event","opaque":true}`,
++		"native Gemini":              `{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`,
++	} {
++		t.Run(name, func(t *testing.T) {
++			buffered, _, err := readStreamBootstrap(context.Background(), completionChunks(payload))
++			if err != nil || len(buffered) != 1 || string(buffered[0].Payload) != payload {
++				t.Fatalf("bootstrap = %v, %v; payload must pass through unchanged", buffered, err)
++			}
++			if isEmptyCompletionPayload([]byte(payload)) {
++				t.Fatal("valid/blocked/unknown output must not rotate credentials")
++			}
++		})
++	}
++}
++
++func TestManagerExecuteStreamRetriesEmptyResponsesBeforeDelivery(t *testing.T) {
++	alias := "gemini-empty-response-regression"
++	executor := &openAICompatPoolExecutor{
++		id: openAICompatPoolProviderKey,
++		streamPayloads: map[string][]cliproxyexecutor.StreamChunk{
++			"empty-upstream": {
++				{Payload: []byte(`{"type":"response.created","response":{"object":"response","status":"in_progress","output":[]}}`)},
++				{Payload: []byte(`{"type":"response.completed","response":{"object":"response","status":"completed","output":[],"usage":{"output_tokens":0}}}`)},
++			},
++		},
++	}
++	manager := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
++		{Name: "empty-upstream", Alias: alias},
++		{Name: "healthy-upstream", Alias: alias},
++	}, executor)
++	result, err := manager.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	var output strings.Builder
++	for chunk := range result.Chunks {
++		if chunk.Err != nil {
++			t.Fatal(chunk.Err)
++		}
++		output.Write(chunk.Payload)
++	}
++	if output.String() != "healthy-upstream" {
++		t.Fatalf("client received %q, want only the healthy attempt", output.String())
++	}
++	if got := executor.StreamModels(); len(got) != 2 || got[0] != "empty-upstream" || got[1] != "healthy-upstream" {
++		t.Fatalf("attempts = %v", got)
++	}
++}
+-- 
+2.43.0
+

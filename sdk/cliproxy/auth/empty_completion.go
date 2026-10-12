@@ -2,7 +2,6 @@ package auth
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"math"
@@ -257,8 +256,7 @@ func isMeaningfulToolCall(raw json.RawMessage) bool {
 }
 
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
-// an OpenAI-style completion is empty. Later slices add Claude/Gemini/Responses
-// evaluators onto the same accum; unused format flags are omitted here.
+// an OpenAI Chat Completions or Responses completion is empty.
 type emptyCompletionAccum struct {
 	expectedChoices       int
 	recognized            bool
@@ -283,7 +281,7 @@ func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
 	}
 	recognized := false
 	for _, v := range values {
-		if a.evalOpenAI(v) {
+		if a.evalOpenAI(v) || a.evalResponses(v) {
 			recognized = true
 		} else {
 			a.sawUnknownData = true
@@ -589,14 +587,4 @@ func (a *emptyCompletionAccum) evalSSE(payload []byte) {
 		processLine(line)
 	}
 	flush()
-}
-
-// markEmptyCompletion records a failed retriable empty-completion result and
-// returns the error to propagate. The mixed duty execution path rotates on an
-// empty completion; the home (credits) path reports it via reportHomeResult.
-func (m *Manager) markEmptyCompletion(ctx context.Context, result *Result) error {
-	result.Success = false
-	result.Error = errEmptyCompletion
-	m.MarkResult(ctx, *result)
-	return errEmptyCompletion
 }

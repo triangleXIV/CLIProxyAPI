@@ -411,7 +411,7 @@ func (e *selectedCapabilityCaptureExecutor) Identifier() string { return e.provi
 
 func (e *selectedCapabilityCaptureExecutor) Execute(_ context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.requests = append(e.requests, req)
-	return cliproxyexecutor.Response{}, nil
+	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
 }
 
 func (e *selectedCapabilityCaptureExecutor) ExecuteStream(_ context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {

@@ -1,0 +1,100 @@
+From c0d361ed9a46aadbdbdfe0418a54d014a8c627b5 Mon Sep 17 00:00:00 2001
+From: triangleXIV <127415617+triangleXIV@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 10:49:47 +0800
+Subject: [PATCH 7/8] fix(antigravity): hide retired Gemini Flash catalog
+ entries
+
+---
+ sdk/cliproxy/antigravity_model_catalog.go      | 14 ++++++++++++++
+ sdk/cliproxy/antigravity_model_catalog_test.go | 14 +++++++++++---
+ sdk/cliproxy/antigravity_models.go             |  3 ++-
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/sdk/cliproxy/antigravity_model_catalog.go b/sdk/cliproxy/antigravity_model_catalog.go
+index 06a5500f..4e1da55e 100644
+--- a/sdk/cliproxy/antigravity_model_catalog.go
++++ b/sdk/cliproxy/antigravity_model_catalog.go
+@@ -22,6 +22,17 @@ type antigravityDiscoveredModel struct {
+ 	ThinkingBudget            *int            `json:"thinkingBudget"`
+ }
+ 
++func isRetiredAntigravityModel(id string) bool {
++	// These catalog entries now return a retirement notice with HTTP 200 rather
++	// than generating a reply. Catalog presence alone does not make them callable.
++	switch id {
++	case "gemini-3-flash-agent", "gemini-3.5-flash-extra-low", "gemini-3.5-flash-low":
++		return true
++	default:
++		return false
++	}
++}
++
+ // Keep curated definitions for existing models, but discover eligible additions
+ // from the same account catalog that grants their routing entitlement.
+ func appendAntigravityDiscoveredModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
+@@ -48,6 +59,9 @@ func appendAntigravityDiscoveredModels(models []*ModelInfo, hints antigravityMod
+ }
+ 
+ func discoveredAntigravityModelInfo(id string, raw json.RawMessage, images map[string]struct{}) *ModelInfo {
++	if isRetiredAntigravityModel(id) {
++		return nil
++	}
+ 	var discovered antigravityDiscoveredModel
+ 	if json.Unmarshal(raw, &discovered) != nil || discovered.IsInternal || strings.TrimSpace(discovered.DisplayName) == "" {
+ 		return nil
+diff --git a/sdk/cliproxy/antigravity_model_catalog_test.go b/sdk/cliproxy/antigravity_model_catalog_test.go
+index 02d921e7..ac60e98f 100644
+--- a/sdk/cliproxy/antigravity_model_catalog_test.go
++++ b/sdk/cliproxy/antigravity_model_catalog_test.go
+@@ -48,8 +48,8 @@ func TestAntigravityDiscoveredCatalogEligibilityAndMetadata(t *testing.T) {
+ 		t.Fatal("catalog parse failed")
+ 	}
+ 	models := applyAntigravityFetchedModelCapabilities(filterAntigravityModels(registry.GetAntigravityModels(), hints), hints)
+-	if len(models) != 11 {
+-		t.Fatalf("expected ten discovered models and one predefined model, got %v", models)
++	if len(models) != 8 {
++		t.Fatalf("expected seven discovered models and one predefined model, got %v", models)
+ 	}
+ 	byID := make(map[string]*ModelInfo)
+ 	for _, model := range models {
+@@ -71,7 +71,7 @@ func TestAntigravityDiscoveredCatalogEligibilityAndMetadata(t *testing.T) {
+ 	if known := byID["gemini-3.1-flash-lite"]; known == nil || known.ContextLength <= 1 || known.DisplayName == "wrong upstream metadata" {
+ 		t.Fatalf("predefined metadata overwritten: %+v", known)
+ 	}
+-	for _, id := range []string{"gemini-3.8-flash-tiered", "gemini-private", "gemini-malformed", "gemini-tts", "gemini-media", "chat_20706", "tab_flash_lite_preview", "imagen-4", "veo-3", "models/proactive-observer-v10", "gemini-image-input", "not-in-static"} {
++	for _, id := range []string{"gemini-3-flash-agent", "gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3.8-flash-tiered", "gemini-private", "gemini-malformed", "gemini-tts", "gemini-media", "chat_20706", "tab_flash_lite_preview", "imagen-4", "veo-3", "models/proactive-observer-v10", "gemini-image-input", "not-in-static"} {
+ 		if byID[id] != nil {
+ 			t.Fatalf("published unsupported model %s", id)
+ 		}
+@@ -92,6 +92,14 @@ func TestAntigravityDiscoveredHintsCloneIsolation(t *testing.T) {
+ 	}
+ }
+ 
++func TestAntigravityRetiredModelsCannotReturnThroughCuratedCatalog(t *testing.T) {
++	const id = "gemini-3-flash-agent"
++	hints := antigravityModelCapabilityHints{ModelIDs: map[string]struct{}{id: {}}}
++	if models := filterAntigravityModels([]*ModelInfo{{ID: id, DisplayName: "Gemini 3.5 Flash"}}, hints); len(models) != 0 {
++		t.Fatal("curated catalog restored a retired model")
++	}
++}
++
+ func TestAntigravityDiscoveredAccountPublicationLifecycle(t *testing.T) {
+ 	resetAntigravityCapabilityCache()
+ 	t.Cleanup(resetAntigravityCapabilityCache)
+diff --git a/sdk/cliproxy/antigravity_models.go b/sdk/cliproxy/antigravity_models.go
+index 6979c79f..e2fc11c4 100644
+--- a/sdk/cliproxy/antigravity_models.go
++++ b/sdk/cliproxy/antigravity_models.go
+@@ -651,7 +651,8 @@ func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabili
+ 	filtered := make([]*ModelInfo, 0, len(models))
+ 	for _, model := range models {
+ 		if model != nil {
+-			if _, ok := hints.ModelIDs[normalizeAntigravityFetchedModelID(model.ID)]; ok {
++			id := normalizeAntigravityFetchedModelID(model.ID)
++			if _, ok := hints.ModelIDs[id]; ok && !isRetiredAntigravityModel(id) {
+ 				filtered = append(filtered, model)
+ 			}
+ 		}
+-- 
+2.43.0
+
