@@ -123,7 +123,7 @@ type refreshMockExecutor struct {
 
 func (e *refreshMockExecutor) Identifier() string { return e.id }
 func (e *refreshMockExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, nil
+	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
 }
 func (e *refreshMockExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	ch := make(chan cliproxyexecutor.StreamChunk, 1)
