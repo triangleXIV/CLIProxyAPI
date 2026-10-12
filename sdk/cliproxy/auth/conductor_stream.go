@@ -93,6 +93,8 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	var completion emptyCompletionAccum
+	bufferedBytes := 0
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -114,14 +116,24 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 			chunk, ok = <-ch
 		}
 		if !ok {
+			if completion.empty() {
+				return nil, true, errEmptyCompletion
+			}
 			return buffered, true, nil
 		}
 		if chunk.Err != nil {
 			return nil, false, chunk.Err
 		}
-		buffered = append(buffered, chunk)
 		if len(chunk.Payload) > 0 {
-			return buffered, false, nil
+			buffered = append(buffered, chunk)
+			completion.observe(chunk.Payload)
+			bufferedBytes += len(chunk.Payload)
+			// Do not commit headers for role/created/signature-only prefixes.
+			// Bound buffering without adding a network deadline, and preserve
+			// unknown output formats byte-for-byte.
+			if completion.ready() || bufferedBytes >= 1<<20 || len(buffered) >= 1024 {
+				return buffered, false, nil
+			}
 		}
 	}
 }
