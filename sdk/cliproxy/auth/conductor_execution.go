@@ -628,6 +628,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
+			if errExec == nil && isEmptyCompletionPayload(resp.Payload) {
+				errExec = markUpstreamExecutionAttemptFromContext(execCtx, errEmptyCompletion)
+				if hasUpstreamExecutionAttempt(errExec) {
+					upstreamErr = errExec
+				}
+				warnLogUpstreamFailure(execCtx, entry, provider, upstreamModel, auth, durationExec, errExec)
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: execOpts, CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)

@@ -93,8 +93,13 @@ func (usage geminiResponsesUsage) JSON() []byte {
 }
 
 func geminiResponsesTerminalState(finishReason string) (eventType, status string, incompleteDetails []byte) {
-	if strings.EqualFold(strings.TrimSpace(finishReason), "MAX_TOKENS") {
+	switch strings.ToUpper(strings.TrimSpace(finishReason)) {
+	case "MAX_TOKENS":
 		return "response.incomplete", "incomplete", []byte(`{"reason":"max_output_tokens"}`)
+	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY":
+		// A filtered answer is not an empty successful completion. Preserve
+		// the refusal boundary so retry logic does not cool healthy accounts.
+		return "response.incomplete", "incomplete", []byte(`{"reason":"content_filter"}`)
 	}
 	return "response.completed", "completed", nil
 }
