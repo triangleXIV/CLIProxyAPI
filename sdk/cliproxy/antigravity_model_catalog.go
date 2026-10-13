@@ -22,6 +22,17 @@ type antigravityDiscoveredModel struct {
 	ThinkingBudget            *int            `json:"thinkingBudget"`
 }
 
+func isRetiredAntigravityModel(id string) bool {
+	// These catalog entries now return a retirement notice with HTTP 200 rather
+	// than generating a reply. Catalog presence alone does not make them callable.
+	switch id {
+	case "gemini-3-flash-agent", "gemini-3.5-flash-extra-low", "gemini-3.5-flash-low":
+		return true
+	default:
+		return false
+	}
+}
+
 // Keep curated definitions for existing models, but discover eligible additions
 // from the same account catalog that grants their routing entitlement.
 func appendAntigravityDiscoveredModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
@@ -48,6 +59,9 @@ func appendAntigravityDiscoveredModels(models []*ModelInfo, hints antigravityMod
 }
 
 func discoveredAntigravityModelInfo(id string, raw json.RawMessage, images map[string]struct{}) *ModelInfo {
+	if isRetiredAntigravityModel(id) {
+		return nil
+	}
 	var discovered antigravityDiscoveredModel
 	if json.Unmarshal(raw, &discovered) != nil || discovered.IsInternal || strings.TrimSpace(discovered.DisplayName) == "" {
 		return nil
