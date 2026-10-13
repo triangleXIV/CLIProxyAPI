@@ -48,8 +48,8 @@ func TestAntigravityDiscoveredCatalogEligibilityAndMetadata(t *testing.T) {
 		t.Fatal("catalog parse failed")
 	}
 	models := applyAntigravityFetchedModelCapabilities(filterAntigravityModels(registry.GetAntigravityModels(), hints), hints)
-	if len(models) != 11 {
-		t.Fatalf("expected ten discovered models and one predefined model, got %v", models)
+	if len(models) != 8 {
+		t.Fatalf("expected seven discovered models and one predefined model, got %v", models)
 	}
 	byID := make(map[string]*ModelInfo)
 	for _, model := range models {
@@ -71,7 +71,7 @@ func TestAntigravityDiscoveredCatalogEligibilityAndMetadata(t *testing.T) {
 	if known := byID["gemini-3.1-flash-lite"]; known == nil || known.ContextLength <= 1 || known.DisplayName == "wrong upstream metadata" {
 		t.Fatalf("predefined metadata overwritten: %+v", known)
 	}
-	for _, id := range []string{"gemini-3.8-flash-tiered", "gemini-private", "gemini-malformed", "gemini-tts", "gemini-media", "chat_20706", "tab_flash_lite_preview", "imagen-4", "veo-3", "models/proactive-observer-v10", "gemini-image-input", "not-in-static"} {
+	for _, id := range []string{"gemini-3-flash-agent", "gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3.8-flash-tiered", "gemini-private", "gemini-malformed", "gemini-tts", "gemini-media", "chat_20706", "tab_flash_lite_preview", "imagen-4", "veo-3", "models/proactive-observer-v10", "gemini-image-input", "not-in-static"} {
 		if byID[id] != nil {
 			t.Fatalf("published unsupported model %s", id)
 		}
@@ -89,6 +89,14 @@ func TestAntigravityDiscoveredHintsCloneIsolation(t *testing.T) {
 	delete(hints.ModelIDs, "gemini-new-image")
 	if models := filterAntigravityModels(nil, hints); len(models) != 0 {
 		t.Fatal("unentitled metadata restored a model")
+	}
+}
+
+func TestAntigravityRetiredModelsCannotReturnThroughCuratedCatalog(t *testing.T) {
+	const id = "gemini-3-flash-agent"
+	hints := antigravityModelCapabilityHints{ModelIDs: map[string]struct{}{id: {}}}
+	if models := filterAntigravityModels([]*ModelInfo{{ID: id, DisplayName: "Gemini 3.5 Flash"}}, hints); len(models) != 0 {
+		t.Fatal("curated catalog restored a retired model")
 	}
 }
 

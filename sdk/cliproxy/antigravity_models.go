@@ -651,7 +651,8 @@ func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabili
 	filtered := make([]*ModelInfo, 0, len(models))
 	for _, model := range models {
 		if model != nil {
-			if _, ok := hints.ModelIDs[normalizeAntigravityFetchedModelID(model.ID)]; ok {
+			id := normalizeAntigravityFetchedModelID(model.ID)
+			if _, ok := hints.ModelIDs[id]; ok && !isRetiredAntigravityModel(id) {
 				filtered = append(filtered, model)
 			}
 		}
