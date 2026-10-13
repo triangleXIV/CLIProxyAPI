@@ -87,19 +87,29 @@ var (
 )
 
 type antigravityFetchAvailableModelsResponse struct {
-	WebSearchModelIDs []string                   `json:"webSearchModelIds"`
-	Models            map[string]json.RawMessage `json:"models"`
+	WebSearchModelIDs       []string                   `json:"webSearchModelIds"`
+	ImageGenerationModelIDs []string                   `json:"imageGenerationModelIds"`
+	Models                  map[string]json.RawMessage `json:"models"`
 }
 
 type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
-	ModelIDs map[string]struct{}
-	revision uint64
+	ModelIDs                map[string]struct{}
+	Models                  map[string]json.RawMessage
+	ImageGenerationModelIDs map[string]struct{}
+	revision                uint64
 }
 
 func (h antigravityModelCapabilityHints) clone() antigravityModelCapabilityHints {
-	return antigravityModelCapabilityHints{WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs), ModelIDs: maps.Clone(h.ModelIDs), revision: h.revision}
+	clone := antigravityModelCapabilityHints{
+		WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs), ModelIDs: maps.Clone(h.ModelIDs),
+		ImageGenerationModelIDs: maps.Clone(h.ImageGenerationModelIDs), Models: maps.Clone(h.Models), revision: h.revision,
+	}
+	for id, raw := range clone.Models {
+		clone.Models[id] = bytes.Clone(raw)
+	}
+	return clone
 }
 
 // antigravityCapabilityKey isolates catalogs by account, project and route, not token lifetime.
@@ -567,15 +577,24 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 		}
 	}
 	var modelIDs map[string]struct{}
+	var models map[string]json.RawMessage
 	if parsed.Models != nil {
 		modelIDs = make(map[string]struct{}, len(parsed.Models))
-		for id := range parsed.Models {
+		models = make(map[string]json.RawMessage, len(parsed.Models))
+		for id, raw := range parsed.Models {
 			if normalized := normalizeAntigravityFetchedModelID(id); normalized != "" {
 				modelIDs[normalized] = struct{}{}
+				models[normalized] = raw
 			}
 		}
 	}
-	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, ModelIDs: modelIDs}, true
+	images := make(map[string]struct{}, len(parsed.ImageGenerationModelIDs))
+	for _, id := range parsed.ImageGenerationModelIDs {
+		if normalized := normalizeAntigravityFetchedModelID(id); normalized != "" {
+			images[normalized] = struct{}{}
+		}
+	}
+	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, ModelIDs: modelIDs, Models: models, ImageGenerationModelIDs: images}, true
 }
 
 func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
@@ -637,7 +656,7 @@ func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabili
 			}
 		}
 	}
-	return filtered
+	return appendAntigravityDiscoveredModels(filtered, hints)
 }
 
 func (s *Service) antigravityModelsForHints(auth *coreauth.Auth, hints antigravityModelCapabilityHints) []*ModelInfo {
