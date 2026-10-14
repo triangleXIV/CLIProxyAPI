@@ -1004,6 +1004,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
 		go func() {
 			tickChan <- time.Unix(1, 0)
 			tickChan <- time.Unix(2, 0)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n")}
 			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n")}
 			close(chunks)
 		}()
@@ -1026,7 +1027,7 @@ func TestResponsesHandlerSendKeepAliveBeforeFT(t *testing.T) {
 			t.Fatalf("status = %d, want 200; body=%q", recorder.Code, recorder.Body.String())
 		}
 		body := recorder.Body.String()
-		if !strings.HasPrefix(body, ": keep-alive\n\n") || !strings.Contains(body, "event: response.completed") {
+		if !strings.HasPrefix(body, ": keep-alive\n\n") || !strings.Contains(body, `"delta":"OK"`) || !strings.Contains(body, "event: response.completed") {
 			t.Fatalf("unexpected stream body: %q", body)
 		}
 	})
